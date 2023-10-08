@@ -1,8 +1,12 @@
-﻿using Microsoft.AspNetCore.Mvc;
+﻿using AutoMapper;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.ModelBinding;
-using System.ComponentModel.DataAnnotations;
+using Microsoft.IdentityModel.Tokens;
+using System.Linq;
+using System.Runtime.CompilerServices;
 using TestDB.Entities;
 using TestTask.Abstractions;
+using TestTask.DTOs;
 using TestTask.Requests;
 using TestTask.Responses;
 
@@ -16,34 +20,95 @@ namespace TestTask.Controllers
     {
         private readonly IUserService _userService;
         private readonly IRoleService _roleService;
-        public UserController(IUserService userService, IRoleService roleService)
+        private readonly IMapper _mapper;
+        private readonly ILogger<UserController> _logger;
+        public UserController(IUserService userService, IRoleService roleService, IMapper mapper, ILogger<UserController> logger)
         {
             _userService = userService;
             _roleService = roleService;
+            _mapper = mapper;
+            _logger = logger;
         }
 
         /// <summary>
         /// Получение списка всех пользователей
         /// </summary>
-        [HttpGet]
-        public async Task<IActionResult> GetAll([FromBody] GetAllUsersWithPagRequest request)
+        [HttpGet("GetAllUsers")]
+        public async Task<IActionResult> GetAll([FromQuery] GetAllUsersWithPagRequest getAllRequest)
         {
-            var users = await _userService.GetAllUsersWithPag(request.PageSize, request.PageNumber);
-            return Ok(users);
+            try
+            {
+                var users = await _userService.GetAllUsersWithPag(getAllRequest.PageSize, getAllRequest.PageNumber);
+                if (!getAllRequest.OrderBy.IsNullOrEmpty())
+                {
+                    switch (getAllRequest.OrderBy)
+                    {
+                        case "Name":
+                            users = users.OrderBy(x => x.Name).ToList();
+                            break;
+                        case "Age":
+                            users = users.OrderBy(x => x.Age).ToList();
+                            break;
+                        case "Email":
+                            users = users.OrderBy(x => x.Email).ToList();
+                            break;
+                        case "RoleName":
+                            users = users.OrderBy(x => x.Roles.OrderBy(x => x.Name)).ToList();
+                            break;
+                        default:
+                            return BadRequest(new ErrorResponse() { Message = "Unknown sort parameter" });
+                    }
+                }
+                if (!getAllRequest.FilterBy.IsNullOrEmpty() && !getAllRequest.FilterByValue.IsNullOrEmpty())
+                {
+                    switch (getAllRequest.FilterBy)
+                    {
+                        case "Name":
+                            users = users.Where(a => a.Name.Equals(getAllRequest.FilterByValue)).ToList();
+                            break;
+                        case "Age":
+                            users = users.Where(a => a.Age.Equals(getAllRequest.FilterByValue)).ToList();
+                            break;
+                        case "Email":
+                            users = users.Where(a => a.Email.Equals(getAllRequest.FilterByValue)).ToList();
+                            break;
+                        case "RoleName":
+                            users = users.Where(a => a.Roles.Any(b => b.Name.Equals(getAllRequest.FilterByValue))).ToList();
+                            break;
+                        default:
+                            return BadRequest(new ErrorResponse() { Message = "Unknown filter parameters" });
+                    }
+                }
+                return Ok(users);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message, ex);
+                return BadRequest(new ErrorResponse() { Message=ex.Message });
+            }
         }
 
         /// <summary>
         ///Получение пользователя по Id и всех его ролей
         /// </summary>
-        [HttpGet("{id}")]
-        public async Task<IActionResult> Get(int id)
+        [HttpGet("GetUserById")]
+        public async Task<IActionResult> Get([FromQuery, BindRequired]int id)
         {
-            var user = await _userService.GetUserById(id);
-            if (user == null)
+            try
             {
-                return NotFound();
+                var user = await _userService.GetUserById(id);
+                if (user == null)
+                {
+                    return NotFound(new ErrorResponse() { Message = "User doesn't exist" });
+                }
+
+                return Ok(_mapper.Map<UserResponse>(user));
             }
-            return Ok(user);
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message, ex);
+                return BadRequest(new ErrorResponse() { Message = ex.Message });
+            }
         }
 
         /// <summary>
@@ -51,70 +116,107 @@ namespace TestTask.Controllers
         /// </summary>
         /// <param name="addUserRequest"></param>
         /// <returns></returns>
-        [HttpPost]       
-        public async Task<IActionResult> AddUser([BindRequired, FromQuery] AddUserRequest addUserRequest)
+        [HttpPost("AddUser")]       
+        public async Task<IActionResult> AddUser([FromQuery] AddUserRequest addUserRequest)
         {
-            if(await _userService.IsEmailExist(addUserRequest.Email))
+            try
             {
-                var user = new User
+                if (!await _userService.IsEmailExist(addUserRequest.Email))
                 {
-                    Name = addUserRequest.UserName,
-                    Age = addUserRequest.Age,
-                    Email = addUserRequest.Email,
-                };
-                var role = await _roleService.GetDefaultRole();
-                user.Roles.Add(role);
-                await _userService.AddUser(user);
-                return Ok();
+                    var role = await _roleService.GetDefaultRole();
+                    var user = new UserDTO
+                    {
+                        Name = addUserRequest.UserName,
+                        Age = addUserRequest.Age,
+                        Email = addUserRequest.Email                        
+                    };                    
+                    await _userService.AddUser(user);
+                    var userRole = await _userService.GetByEmail(addUserRequest.Email);
+                    await _userService.AddRoleToUser(role, userRole.ID);
+                    return Ok();
+                }
+                return BadRequest(new ErrorResponse() { Message = "Email already exist" });
             }
-            return BadRequest(new ErrorResponse() { Message = "Email already exist" });
+            catch(Exception ex)
+            {
+                _logger.LogError(ex.Message, ex);
+                return BadRequest(new ErrorResponse() { Message= ex.Message });
+            }
         }
 
         /// <summary>
         /// Добавление пользователю роли
         /// </summary>
-        /// <param name="request"></param>
+        /// <param name="addRoleRequest"></param>
         /// <returns></returns>
-        [HttpPatch("{id}, {RoleName}")]
-        public async Task<IActionResult> AddRoleToUser([FromBody] AddRoleRequest request)
+        [HttpPatch("AddRoleToUser")]
+        public async Task<IActionResult> AddRoleToUser([FromQuery] AddRoleRequest addRoleRequest)
         {
-            var role = await _roleService.GetRoleByName(request.RoleName);
-            if(await _roleService.IsRoleExists(request.RoleName) && !await _userService.HasRole(request.UserId, role))
+            try
             {
-                await _userService.AddRoleToUser(role, request.UserId);
+                var role = await _roleService.GetRoleByName(addRoleRequest.RoleName);
+                if (await _roleService.IsRoleExists(addRoleRequest.RoleName) && !await _userService.HasRole(addRoleRequest.UserId, role))
+                {
+                    await _userService.AddRoleToUser(role, addRoleRequest.UserId);
+                    return Ok();
+                }
+                return BadRequest(new ErrorResponse() { Message = "Role doesn't exist or User already have this role" });
             }
-            return BadRequest(new ErrorResponse() { Message = "Role doesn't exist or User already have this role" });
+            catch(Exception ex)
+            {
+                _logger.LogError(ex.Message, ex);
+                return BadRequest(new ErrorResponse() { Message =  ex.Message });
+            }
         }
 
         /// <summary>
         /// Обновление информации о пользователе по Id
         /// </summary>
-        /// <param name="request"></param>
+        /// <param name="updateUserRequest"></param>
         /// <returns></returns>
-        [HttpPost("{id},{Name}, {Age}, {Email}")]
-        public async Task<IActionResult> UpdateUserInfo([FromBody] UpdateUserRequest request)
+        [HttpPost("UpdateUserInfo")]
+        public async Task<IActionResult> UpdateUserInfo([FromQuery] UpdateUserRequest updateUserRequest)
         {
-            var user = await _userService.GetUserById(request.UserId);
-            user.Name = request.UserName;
-            user.Age = request.Age;
-            user.Email = request.Email;
-            await _userService.UpdateUser(user);
-            return Ok();
+            try
+            {
+                var valuesToPatch = new List<PatchDTO>()
+                {
+                    new PatchDTO(){Name = "Name", Value = updateUserRequest.UserName},
+                    new PatchDTO(){Name = "Age", Value = updateUserRequest.Age},
+                    new PatchDTO(){Name = "Email", Value = updateUserRequest.Email}
+                };
+                await _userService.UpdateUser(updateUserRequest.UserId, valuesToPatch);
+                
+                return Ok();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message, ex);
+                return BadRequest(new ErrorResponse() { Message = ex.Message});
+            }
         }
         /// <summary>
-        /// Удалиние пользователя по Id
+        /// Удаление пользователя по Id
         /// </summary>
         /// <param name="id"></param>
         /// <returns></returns>
-        [HttpDelete("{id}")]
-        public async Task<IActionResult> DeleteUser(int id)
+        [HttpDelete("DeleteUserById")]
+        public async Task<IActionResult> DeleteUser([FromQuery, BindRequired] int id)
         {
-            if(!await _userService.IsUserExists(id))
+            try
             {
-                await _userService.DeleteUser(id);
-                return Ok();
+                if (await _userService.IsUserExists(id))
+                {
+                    await _userService.DeleteUser(id);
+                    return Ok();
+                }
+                return BadRequest(new ErrorResponse() { Message = "User doesn't exist" });
             }
-            return BadRequest(new ErrorResponse() { Message = "User doesn't exist" });
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message, ex);
+                return BadRequest(new ErrorResponse() { Message=ex.Message});
+            }
             
         }
 
